@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NCS — Nice Clean School</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Sarabun', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { animation: spin 1s linear infinite; display: inline-block; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "react":              "https://esm.sh/react@18",
+    "react-dom/client":   "https://esm.sh/react-dom@18/client",
+    "firebase/app":       "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js",
+    "firebase/firestore": "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js"
+  }
+}
+</script>
+
+<script type="module">
+import React, { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
+import { initializeApp } from "firebase/app";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc,
+  updateDoc, deleteDoc, query, where, orderBy, runTransaction, serverTimestamp
+} from "firebase/firestore";
+
+// ─── Firebase Config ────────────────────────────────────────────────────────
+const app = initializeApp({
+  apiKey:            "AIzaSyDx-51713m6ch8XTnN3qfIfFJHAjSl0lco",
+  authDomain:        "ncs-school-93ba3.firebaseapp.com",
+  projectId:         "ncs-school-93ba3",
+  storageBucket:     "ncs-school-93ba3.firebasestorage.app",
+  messagingSenderId: "770262386900",
+  appId:             "1:770262386900:web:df9e1581cc36ab6f2a5341",
+});
+const db = getFirestore(app);
+
+// ─── DB Functions ────────────────────────────────────────────────────────────
+const hashPassword = async (pw) => {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,"0")).join("");
+};
+
+// รูปภาพเก็บเป็น base64 ใน Firestore (ไม่ใช้ Storage เพราะต้องจ่ายเงิน)
+const compressImage = (base64, maxW=800) => new Promise(res => {
+  const img = new Image();
+  img.onload = () => {
+    const ratio = Math.min(1, maxW / img.width);
+    const canvas = document.createElement("canvas");
+    canvas.width = img.width * ratio;
+    canvas.height = img.height * ratio;
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    res(canvas.toDataURL("image/jpeg", 0.6));
+  };
+  img.src = base64;
+});
+
+async function seedAdmin() {
+  const ref_ = doc(db, "users", "admin");
+  const snap = await getDoc(ref_);
+  if (!snap.exists()) {
+    await setDoc(ref_, {
+      name: "สภานักเรียน", student_id: "admin",
+      password: "dad74d88a336d64cfcc5532c00e5e60d4c10d1ef5ee43ac8d1532209e2ca1ba5",
+      role: "admin", points: 0,
+    });
+  }
+  const rSnap = await getDocs(collection(db, "rewards"));
+  if (rSnap.empty) {
+    for (const r of [
+      { name:"ไอติมแท่ง", points_required:20, stock:10 },
+      { name:"สมุดโน้ต",  points_required:50, stock:5  },
+      { name:"ปากกา",     points_required:30, stock:8  },
+    ]) await addDoc(collection(db, "rewards"), r);
+  }
+}
+
+async function loginUser(student_id, password) {
+  const hash = await hashPassword(password);
+  const snap = await getDocs(query(collection(db,"users"), where("student_id","==",student_id)));
+  if (snap.empty) throw new Error("รหัสนักเรียนหรือรหัสผ่านไม่ถูกต้อง");
+  const d = snap.docs[0];
+  if (d.data().password !== hash) throw new Error("รหัสนักเรียนหรือรหัสผ่านไม่ถูกต้อง");
+  return { id: d.id, ...d.data() };
+}
+
+async function registerUser(name, student_id, password) {
+  const hash = await hashPassword(password);
+  const ex = await getDocs(query(collection(db,"users"), where("student_id","==",student_id)));
+  if (!ex.empty) throw new Error("รหัสนักเรียนนี้ถูกใช้แล้ว");
+  const ref_ = await addDoc(collection(db,"users"), { name, student_id, password:hash, role:"student", points:0 });
+  return { id:ref_.id, name, student_id, role:"student", points:0 };
+}
+
+async function getUser(id) {
+  const snap = await getDoc(doc(db,"users",id));
+  return snap.exists() ? { id:snap.id, ...snap.data() } : null;
+}
+
+async function submitWork(userId, userName, description, base64Image) {
+  const compressed = base64Image ? await compressImage(base64Image) : null;
+  return await addDoc(collection(db,"submissions"), {
+    user_id:userId, user_name:userName, description,
+    image: compressed, status:"pending", points_awarded:0,
+    created_at: serverTimestamp(),
+  });
+}
+
+async function getSubmissionsByUser(userId) {
+  const snap = await getDocs(query(collection(db,"submissions"), where("user_id","==",userId), orderBy("created_at","desc")));
+  return snap.docs.map(d => ({ id:d.id, ...d.data(), created_at:d.data().created_at?.toMillis?.()??Date.now() }));
+}
+
+async function getAllSubmissions() {
+  const snap = await getDocs(query(collection(db,"submissions"), orderBy("created_at","desc")));
+  return snap.docs.map(d => ({ id:d.id, ...d.data(), created_at:d.data().created_at?.toMillis?.()??Date.now() }));
+}
+
+async function approveSubmission(subId, userId, points) {
+  await runTransaction(db, async tx => {
+    const uRef = doc(db,"users",userId);
+    const uSnap = await tx.get(uRef);
+    tx.update(doc(db,"submissions",subId), { status:"approved", points_awarded:points });
+    tx.update(uRef, { points:(uSnap.data().points||0)+points });
+  });
+}
+
+async function rejectSubmission(subId, reason) {
+  await updateDoc(doc(db,"submissions",subId), { status:"rejected", reject_reason:reason||"" });
+}
+
+async function getRewards() {
+  const snap = await getDocs(collection(db,"rewards"));
+  return snap.docs.map(d => ({ id:d.id, ...d.data() }));
+}
+
+async function addReward(name, pts, stock) {
+  return (await addDoc(collection(db,"rewards"), { name, points_required:+pts, stock:+stock })).id;
+}
+
+async function updateReward(id, data) {
+  await updateDoc(doc(db,"rewards",id), { name:data.name, points_required:+data.points_required, stock:+data.stock });
+}
+
+async function deleteReward(id) { await deleteDoc(doc(db,"rewards",id)); }
+
+async function redeemReward(userId, rewardId, rewardName, pointsRequired) {
+  await runTransaction(db, async tx => {
+    const uRef = doc(db,"users",userId);
+    const rRef = doc(db,"rewards",rewardId);
+    const [uSnap,rSnap] = await Promise.all([tx.get(uRef), tx.get(rRef)]);
+    if ((uSnap.data().points||0) < pointsRequired) throw new Error("แต้มไม่เพียงพอ");
+    if ((rSnap.data().stock||0) <= 0) throw new Error("ของรางวัลหมดแล้ว");
+    tx.update(uRef, { points:(uSnap.data().points||0)-pointsRequired });
+    tx.update(rRef, { stock:(rSnap.data().stock||0)-1 });
+    tx.set(doc(collection(db,"redemptions")), {
+      user_id:userId, reward_id:rewardId, reward_name:rewardName,
+      status:"pending", created_at:serverTimestamp(),
+    });
+  });
+}
+
+async function getRedemptionsByUser(userId) {
+  const snap = await getDocs(query(collection(db,"redemptions"), where("user_id","==",userId), orderBy("created_at","desc")));
+  return snap.docs.map(d => ({ id:d.id, ...d.data(), created_at:d.data().created_at?.toMillis?.()??Date.now() }));
+}
+
+async function getAllRedemptions() {
+  const snap = await getDocs(query(collection(db,"redemptions"), orderBy("created_at","desc")));
+  return snap.docs.map(d => ({ id:d.id, ...d.data(), created_at:d.data().created_at?.toMillis?.()??Date.now() }));
+}
+
+async function approveRedemption(id) { await updateDoc(doc(db,"redemptions",id), { status:"approved" }); }
+
+async function rejectRedemption(id, userId, rewardId, pts) {
+  await runTransaction(db, async tx => {
+    const uRef = doc(db,"users",userId);
+    const rRef = doc(db,"rewards",rewardId);
+    const [uSnap,rSnap] = await Promise.all([tx.get(uRef), tx.get(rRef)]);
+    tx.update(uRef, { points:(uSnap.data().points||0)+pts });
+    tx.update(rRef, { stock:(rSnap.data().stock||0)+1 });
+    tx.update(doc(db,"redemptions",id), { status:"rejected" });
+  });
+}
+
+async function getLeaderboard() {
+  const snap = await getDocs(query(collection(db,"users"), where("role","==","student"), orderBy("points","desc")));
+  return snap.docs.map(d => ({ id:d.id, ...d.data() }));
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const statusLabel = { pending:"รออนุมัติ", approved:"อนุมัติแล้ว", rejected:"ปฏิเสธ" };
+const statusColor = { pending:"#D97706", approved:"#059669", rejected:"#DC2626" };
+const statusBg    = { pending:"#FEF3C7", approved:"#D1FAE5", rejected:"#FEE2E2" };
+
+const h = React.createElement;
+
+// ─── Styles ──────────────────────────────────────────────────────────────────
+const S = {
+  app:       { fontFamily:"'Sarabun',sans-serif", minHeight:"100vh", background:"#F0F4FF" },
+  nav:       { background:"#1E3A8A", padding:"0 20px", display:"flex", alignItems:"center", justifyContent:"space-between", height:58, boxShadow:"0 2px 12px rgba(30,58,138,.2)" },
+  navBrand:  { color:"#fff", fontWeight:800, fontSize:20, display:"flex", alignItems:"center", gap:8 },
+  navRight:  { display:"flex", alignItems:"center", gap:12 },
+  navPts:    { background:"#DC2626", color:"#fff", padding:"4px 12px", borderRadius:20, fontSize:13, fontWeight:700 },
+  navUser:   { color:"#BFD3FF", fontSize:13 },
+  navBtn:    { background:"rgba(255,255,255,.12)", border:"1px solid rgba(255,255,255,.2)", color:"#fff", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:13, fontFamily:"inherit" },
+  sidebar:   { width:210, background:"#fff", minHeight:"calc(100vh - 58px)", borderRight:"1px solid #E0E9FF", flexShrink:0 },
+  sideItem:  a => ({ display:"flex", alignItems:"center", gap:10, padding:"12px 20px", cursor:"pointer", color:a?"#1E3A8A":"#64748B", fontWeight:a?700:400, background:a?"#EEF2FF":"transparent", borderLeft:a?"3px solid #1E3A8A":"3px solid transparent", fontSize:14 }),
+  main:      { flex:1, padding:"28px 24px", maxWidth:940, margin:"0 auto", width:"100%" },
+  card:      { background:"#fff", borderRadius:14, padding:24, marginBottom:20, boxShadow:"0 1px 6px rgba(30,58,138,.06)", border:"1px solid #E0E9FF" },
+  h2:        { fontSize:20, fontWeight:800, color:"#1E3A8A", marginBottom:18 },
+  statGrid:  { display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12, marginBottom:20 },
+  stat:      c => ({ background:c||"#EEF2FF", borderRadius:12, padding:"18px 20px", textAlign:"center" }),
+  statNum:   { fontSize:30, fontWeight:800, color:"#1E3A8A" },
+  statLbl:   { fontSize:12, color:"#64748B", marginTop:3 },
+  btn:       v => { const m={primary:{background:"#1E3A8A",color:"#fff",border:"none"},danger:{background:"#DC2626",color:"#fff",border:"none"},success:{background:"#059669",color:"#fff",border:"none"},ghost:{background:"#fff",color:"#1E3A8A",border:"1px solid #CBD5E1"}}; return {...(m[v]||m.primary),padding:"8px 16px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:5}; },
+  input:     { width:"100%", padding:"10px 13px", borderRadius:8, border:"1.5px solid #CBD5E1", fontSize:14, outline:"none", boxSizing:"border-box", fontFamily:"inherit" },
+  label:     { fontSize:13, fontWeight:600, color:"#374151", marginBottom:5, display:"block" },
+  badge:     s => ({ display:"inline-block", padding:"3px 10px", borderRadius:12, fontSize:12, fontWeight:700, background:statusBg[s]||"#F1F5F9", color:statusColor[s]||"#64748B" }),
+  row:       { display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" },
+  table:     { width:"100%", borderCollapse:"collapse" },
+  th:        { textAlign:"left", padding:"9px 13px", borderBottom:"2px solid #E0E9FF", fontSize:12, fontWeight:700, color:"#64748B" },
+  td:        { padding:"11px 13px", borderBottom:"1px solid #F1F5F9", fontSize:13, verticalAlign:"middle" },
+  thumb:     { width:52, height:52, objectFit:"cover", borderRadius:7, border:"1px solid #E0E9FF" },
+  modal:     { position:"fixed", inset:0, background:"rgba(15,23,42,.55)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 },
+  modalBox:  { background:"#fff", borderRadius:16, padding:28, width:"90%", maxWidth:420, maxHeight:"90vh", overflowY:"auto", boxShadow:"0 8px 40px rgba(30,58,138,.18)" },
+  authWrap:  { minHeight:"100vh", background:"linear-gradient(135deg,#1E3A8A 0%,#1d4ed8 55%,#DC2626 100%)", display:"flex", alignItems:"center", justifyContent:"center" },
+  authCard:  { background:"#fff", borderRadius:18, padding:"36px 32px", width:"90%", maxWidth:380, boxShadow:"0 12px 48px rgba(30,58,138,.22)" },
+  load:      { display:"flex", alignItems:"center", justifyContent:"center", padding:56, color:"#94A3B8", gap:8, fontSize:14 },
+};
+
+// ─── SVG Icons ───────────────────────────────────────────────────────────────
+const Ico = {
+  leaf:    h("span",{style:{fontSize:22}},"🌿"),
+  star:    h("span",null,"⭐"),
+  out:     h("span",null,"🚪"),
+  dash:    h("span",null,"📊"),
+  upload:  h("span",null,"📷"),
+  hist:    h("span",null,"📋"),
+  gift:    h("span",null,"🎁"),
+  trophy:  h("span",null,"🏆"),
+  check:   h("span",null,"✅"),
+  x:       h("span",null,"❌"),
+  trash:   h("span",null,"🗑️"),
+  plus:    h("span",null,"➕"),
+  spin:    h("span",{className:"spin"},["⏳"]),
+};
+
+const Spin = () => h("span",{className:"spin",style:{display:"inline-block"}},"⏳");
+const Loading = () => h("div",{style:S.load}, h(Spin), " กำลังโหลด...");
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [user, setUser]   = useState(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    seedAdmin().finally(() => setReady(true));
+    try { const u = JSON.parse(sessionStorage.getItem("ncs_u")); if(u) setUser(u); } catch(e){}
+  }, []);
+
+  const login  = u => { setUser(u); sessionStorage.setItem("ncs_u", JSON.stringify(u)); };
+  const logout = ()=> { setUser(null); sessionStorage.removeItem("ncs_u"); };
+  const setU   = u => { setUser(u); sessionStorage.setItem("ncs_u", JSON.stringify(u)); };
+
+  if (!ready) return h("div",{style:S.authWrap}, h(Loading));
+  if (!user)  return h(AuthScreen, {onLogin:login});
+  if (user.role==="admin") return h(AdminApp, {user, setUser:setU, logout});
+  return h(StudentApp, {user, setUser:setU, logout});
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+function AuthScreen({onLogin}) {
+  const [mode, setMode] = useState("login");
+  const [form, setForm] = useState({name:"",student_id:"",password:""});
+  const [err, setErr]   = useState("");
+  const [busy, setBusy] = useState(false);
+  const set = k => e => setForm({...form,[k]:e.target.value});
+
+  const submit = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (mode==="login") { onLogin(await loginUser(form.student_id, form.password)); }
+      else {
+        if (!form.name||!form.student_id||!form.password) throw new Error("กรุณากรอกข้อมูลให้ครบ");
+        onLogin(await registerUser(form.name, form.student_id, form.password));
+      }
+    } catch(e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  return h("div",{style:S.authWrap},
+    h("div",{style:S.authCard},
+      h("div",{style:{textAlign:"center",marginBottom:24}},
+        h("div",{style:{display:"inline-flex",alignItems:"center",justifyContent:"center",width:60,height:60,borderRadius:"50%",background:"#1E3A8A",marginBottom:10,fontSize:28}},"🌿"),
+        h("div",{style:{fontSize:24,fontWeight:800,color:"#1E3A8A"}},"NCS"),
+        h("div",{style:{fontSize:13,color:"#64748B"}},"Nice Clean School"),
+      ),
+      h("div",{style:{display:"flex",background:"#F1F5F9",borderRadius:9,padding:3,marginBottom:20}},
+        ["login","register"].map(m =>
+          h("button",{key:m,onClick:()=>setMode(m),style:{flex:1,padding:"8px 0",border:"none",borderRadius:7,cursor:"pointer",fontWeight:mode===m?700:400,background:mode===m?"#fff":"transparent",color:"#1E3A8A",fontSize:14,fontFamily:"inherit",boxShadow:mode===m?"0 1px 4px rgba(0,0,0,.08)":"none"}},
+            m==="login"?"เข้าสู่ระบบ":"สมัครสมาชิก")
+        )
+      ),
+      mode==="register" && h("div",{style:{marginBottom:13}},
+        h("label",{style:S.label},"ชื่อ-นามสกุล"),
+        h("input",{style:S.input,placeholder:"ชื่อ-นามสกุล",value:form.name,onChange:set("name")}),
+      ),
+      h("div",{style:{marginBottom:13}},
+        h("label",{style:S.label},"รหัสนักเรียน"),
+        h("input",{style:S.input,placeholder:"รหัสนักเรียน",value:form.student_id,onChange:set("student_id")}),
+      ),
+      h("div",{style:{marginBottom:18}},
+        h("label",{style:S.label},"รหัสผ่าน"),
+        h("input",{style:S.input,type:"password",placeholder:"รหัสผ่าน",value:form.password,onChange:set("password"),onKeyDown:e=>e.key==="Enter"&&submit()}),
+      ),
+      err && h("div",{style:{color:"#DC2626",fontSize:13,marginBottom:13,background:"#FEE2E2",padding:"8px 12px",borderRadius:8}},err),
+      h("button",{style:{...S.btn("primary"),width:"100%",justifyContent:"center",padding:"11px 0"},onClick:submit,disabled:busy},
+        busy ? h(Spin) : mode==="login"?"เข้าสู่ระบบ":"สมัครสมาชิก"
+      ),
+    )
+  );
+}
+
+// ─── Shared ───────────────────────────────────────────────────────────────────
+function Navbar({user,logout}) {
+  return h("nav",{style:S.nav},
+    h("div",{style:S.navBrand}, Ico.leaf, " NCS ",
+      h("span",{style:{width:7,height:7,borderRadius:"50%",background:"#DC2626",display:"inline-block"}}),
+      h("span",{style:{fontSize:13,fontWeight:400,color:"#BFD3FF"}}," Nice Clean School"),
+    ),
+    h("div",{style:S.navRight},
+      user.role==="student" && h("div",{style:S.navPts},"⭐ "+user.points+" แต้ม"),
+      h("div",{style:S.navUser},"👤 "+user.name),
+      h("button",{style:S.navBtn,onClick:logout},"ออกจากระบบ"),
+    )
+  );
+}
+
+function Sidebar({pages,active,onNav}) {
+  return h("aside",{style:S.sidebar},
+    pages.map(p => h("div",{key:p.id,style:S.sideItem(active===p.id),onClick:()=>onNav(p.id)}, p.icon," ",p.label))
+  );
+}
+
+// ─── Student ──────────────────────────────────────────────────────────────────
+function StudentApp({user,setUser,logout}) {
+  const [page,setPage] = useState("dashboard");
+  const refresh = async () => { const u=await getUser(user.id); if(u) setUser(u); };
+  const pages = [
+    {id:"dashboard", label:"ภาพรวม",        icon:"📊"},
+    {id:"submit",    label:"ส่งงานเก็บขยะ", icon:"📷"},
+    {id:"history",   label:"ประวัติการส่ง",  icon:"📋"},
+    {id:"rewards",   label:"แลกของรางวัล",   icon:"🎁"},
+    {id:"board",     label:"อันดับ",          icon:"🏆"},
+  ];
+  return h("div",{style:S.app},
+    h(Navbar,{user,logout}),
+    h("div",{style:{display:"flex"}},
+      h(Sidebar,{pages,active:page,onNav:setPage}),
+      h("div",{style:{flex:1}},
+        h("div",{style:S.main},
+          page==="dashboard" && h(StudentDash,{user,onNav:setPage}),
+          page==="submit"    && h(SubmitPage,{user,onDone:()=>{refresh();setPage("history");}}),
+          page==="history"   && h(HistoryPage,{user}),
+          page==="rewards"   && h(RewardsPage,{user,onRedeem:refresh}),
+          page==="board"     && h(LeaderboardPage,null),
+        )
+      )
+    )
+  );
+}
+
+function StudentDash({user,onNav}) {
+  const [subs,setSubs] = useState([]); const [loading,setLoading]=useState(true);
+  useEffect(()=>{ getSubmissionsByUser(user.id).then(s=>{setSubs(s);setLoading(false);}); },[]);
+  if(loading) return h(Loading);
+  const approved=subs.filter(s=>s.status==="approved").length;
+  const pending=subs.filter(s=>s.status==="pending").length;
+  return h("div",null,
+    h("div",{style:{fontSize:24,fontWeight:800,color:"#1E3A8A",marginBottom:3}},"สวัสดี, "+user.name+" 👋"),
+    h("div",{style:{color:"#64748B",marginBottom:20,fontSize:13}},"รหัสนักเรียน: "+user.student_id),
+    h("div",{style:S.statGrid},
+      h("div",{style:S.stat("#EEF2FF")}, h("div",{style:S.statNum},user.points), h("div",{style:S.statLbl},"⭐ แต้มสะสม")),
+      h("div",{style:S.stat("#DCFCE7")}, h("div",{style:S.statNum},approved), h("div",{style:S.statLbl},"✅ งานอนุมัติ")),
+      h("div",{style:S.stat("#FEF3C7")}, h("div",{style:S.statNum},pending), h("div",{style:S.statLbl},"⏳ รออนุมัติ")),
+      h("div",{style:S.stat("#FEE2E2")}, h("div",{style:S.statNum},subs.length), h("div",{style:S.statLbl},"📋 ส่งทั้งหมด")),
+    ),
+    h("div",{style:S.card},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:14}},"งานล่าสุด"),
+      subs.length===0
+        ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:28}},"ยังไม่มีการส่งงาน")
+        : subs.slice(0,3).map(s=>h("div",{key:s.id,style:{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:"1px solid #F1F5F9"}},
+            s.image && h("img",{src:s.image,style:S.thumb}),
+            h("div",{style:{flex:1}},
+              h("div",{style:{fontSize:14,fontWeight:600}},s.description),
+              h("div",{style:{fontSize:12,color:"#94A3B8"}},new Date(s.created_at).toLocaleString("th-TH")),
+            ),
+            h("span",{style:S.badge(s.status)},statusLabel[s.status]),
+            s.status==="approved" && h("span",{style:{color:"#059669",fontWeight:700,fontSize:13}},"+"+s.points_awarded),
+          )),
+      h("button",{style:{...S.btn("primary"),marginTop:14},onClick:()=>onNav("submit")},"📷 ส่งงานใหม่"),
+    )
+  );
+}
+
+function SubmitPage({user,onDone}) {
+  const [desc,setDesc]=useState(""); const [img,setImg]=useState(null);
+  const [err,setErr]=useState(""); const [busy,setBusy]=useState(false); const [ok,setOk]=useState(false);
+  const ref_=useRef();
+  const handleFile=e=>{ const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>setImg(ev.target.result); r.readAsDataURL(f); };
+  const submit=async()=>{
+    if(!desc){setErr("กรุณาใส่รายละเอียด");return;}
+    if(!img){setErr("กรุณาอัปโหลดรูปภาพ");return;}
+    setBusy(true);
+    try{ await submitWork(user.id,user.name,desc,img); setOk(true); setTimeout(onDone,1500); }
+    catch(e){setErr(e.message);}
+    setBusy(false);
+  };
+  if(ok) return h("div",{style:{textAlign:"center",padding:72}},
+    h("div",{style:{fontSize:56}},"✅"),
+    h("div",{style:{fontSize:20,fontWeight:700,color:"#059669",marginTop:14}},"ส่งงานสำเร็จ!"),
+    h("div",{style:{color:"#64748B",marginTop:6}},"กำลังรอการอนุมัติจากแอดมิน..."),
+  );
+  return h("div",null,
+    h("div",{style:S.h2},"📷 ส่งงานเก็บขยะ"),
+    h("div",{style:S.card},
+      h("div",{style:{marginBottom:18}},
+        h("label",{style:S.label},"รูปภาพหลักฐาน *"),
+        h("div",{onClick:()=>ref_.current.click(),style:{border:"2px dashed #CBD5E1",borderRadius:10,padding:28,textAlign:"center",cursor:"pointer",background:"#F8FAFF"}},
+          img ? h("img",{src:img,style:{maxHeight:200,maxWidth:"100%",borderRadius:8}})
+              : h("div",null,h("div",{style:{fontSize:32,marginBottom:6}},"📷"),h("div",{style:{color:"#64748B",fontWeight:600}},"คลิกเพื่ออัปโหลดรูปภาพ"),h("div",{style:{color:"#94A3B8",fontSize:12,marginTop:3}},"PNG, JPG, WEBP")),
+        ),
+        h("input",{ref:ref_,type:"file",accept:"image/*",style:{display:"none"},onChange:handleFile}),
+        img && h("button",{style:{...S.btn("ghost"),marginTop:7,fontSize:12},onClick:()=>{setImg(null);ref_.current.value="";}}, "ลบรูป"),
+      ),
+      h("div",{style:{marginBottom:18}},
+        h("label",{style:S.label},"รายละเอียด *"),
+        h("textarea",{style:{...S.input,height:90,resize:"vertical"},placeholder:"อธิบายสิ่งที่ทำ เช่น เก็บขยะบริเวณสนาม 2 ถุงใหญ่...",value:desc,onChange:e=>setDesc(e.target.value)}),
+      ),
+      err && h("div",{style:{color:"#DC2626",fontSize:13,marginBottom:13,background:"#FEE2E2",padding:"8px 12px",borderRadius:8}},err),
+      h("button",{style:S.btn("primary"),onClick:submit,disabled:busy}, busy?h(Spin):"📤 ส่งงาน"),
+    )
+  );
+}
+
+function HistoryPage({user}) {
+  const [subs,setSubs]=useState([]); const [loading,setLoading]=useState(true); const [det,setDet]=useState(null);
+  useEffect(()=>{ getSubmissionsByUser(user.id).then(s=>{setSubs(s);setLoading(false);}); },[]);
+  if(loading) return h(Loading);
+  return h("div",null,
+    h("div",{style:S.h2},"📋 ประวัติการส่งงาน"),
+    h("div",{style:S.card},
+      subs.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:40}},"ยังไม่มีประวัติ")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["รูป","รายละเอียด","วันที่","สถานะ","แต้ม"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,subs.map(s=>h("tr",{key:s.id,style:{cursor:"pointer"},onClick:()=>setDet(s)},
+            h("td",{style:S.td},s.image?h("img",{src:s.image,style:S.thumb}):"-"),
+            h("td",{style:S.td},h("div",{style:{maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},s.description)),
+            h("td",{style:S.td},new Date(s.created_at).toLocaleDateString("th-TH")),
+            h("td",{style:S.td},h("span",{style:S.badge(s.status)},statusLabel[s.status])),
+            h("td",{style:S.td},s.status==="approved"?h("span",{style:{color:"#059669",fontWeight:700}},"+"+s.points_awarded):"-"),
+          )))
+        )
+    ),
+    det && h("div",{style:S.modal,onClick:()=>setDet(null)},
+      h("div",{style:S.modalBox,onClick:e=>e.stopPropagation()},
+        det.image && h("img",{src:det.image,style:{width:"100%",borderRadius:10,marginBottom:14}}),
+        h("div",{style:{fontWeight:700,marginBottom:4}},"รายละเอียด: "+det.description),
+        h("div",{style:{marginBottom:8}},"สถานะ: ",h("span",{style:S.badge(det.status)},statusLabel[det.status])),
+        det.status==="approved" && h("div",{style:{color:"#059669",fontWeight:700,marginBottom:6}},"ได้รับ +"+det.points_awarded+" แต้ม"),
+        det.reject_reason && h("div",{style:{color:"#DC2626",background:"#FEE2E2",padding:9,borderRadius:7,fontSize:13}},"เหตุผล: "+det.reject_reason),
+        h("button",{style:{...S.btn("ghost"),marginTop:14},onClick:()=>setDet(null)},"ปิด"),
+      )
+    )
+  );
+}
+
+function RewardsPage({user,onRedeem}) {
+  const [rewards,setRewards]=useState([]); const [myReds,setMyReds]=useState([]);
+  const [loading,setLoading]=useState(true); const [confirm,setConfirm]=useState(null);
+  const [msg,setMsg]=useState(""); const [busy,setBusy]=useState(false);
+  const load=async()=>{ const [r,d]=await Promise.all([getRewards(),getRedemptionsByUser(user.id)]); setRewards(r);setMyReds(d);setLoading(false); };
+  useEffect(()=>{ load(); },[]);
+  const doRedeem=async r=>{ setBusy(true); try{ await redeemReward(user.id,r.id,r.name,r.points_required); await load(); onRedeem(); setConfirm(null); setMsg("แลกของสำเร็จ! รอแอดมินอนุมัติ"); }catch(e){setMsg(e.message);setConfirm(null);} setBusy(false); };
+  if(loading) return h(Loading);
+  return h("div",null,
+    h("div",{style:S.h2},"🎁 แลกของรางวัล"),
+    msg && h("div",{style:{background:"#D1FAE5",color:"#065F46",padding:"9px 14px",borderRadius:9,marginBottom:14,fontWeight:600}},msg),
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:14,marginBottom:24}},
+      rewards.map(r=>{ const can=user.points>=r.points_required&&r.stock>0;
+        return h("div",{key:r.id,style:{...S.card,marginBottom:0,textAlign:"center",opacity:can?1:.6}},
+          h("div",{style:{fontSize:36,marginBottom:7}},"🎁"),
+          h("div",{style:{fontWeight:700,fontSize:15,marginBottom:5}},r.name),
+          h("div",{style:{color:"#DC2626",fontWeight:800,fontSize:19,marginBottom:3}},r.points_required+" แต้ม"),
+          h("div",{style:{fontSize:12,color:"#94A3B8",marginBottom:12}},"คงเหลือ "+r.stock+" ชิ้น"),
+          h("button",{style:S.btn(can?"primary":"ghost"),onClick:()=>can&&setConfirm(r),disabled:!can},r.stock<=0?"หมดแล้ว":"แลกเลย"),
+        );
+      })
+    ),
+    h("div",{style:S.h2},"ประวัติการแลก"),
+    h("div",{style:S.card},
+      myReds.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:28}},"ยังไม่มีประวัติ")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["ของรางวัล","วันที่","สถานะ"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,myReds.map(r=>h("tr",{key:r.id},
+            h("td",{style:S.td},r.reward_name),
+            h("td",{style:S.td},new Date(r.created_at).toLocaleDateString("th-TH")),
+            h("td",{style:S.td},h("span",{style:S.badge(r.status==="approved"?"approved":r.status==="rejected"?"rejected":"pending")},r.status==="approved"?"รับแล้ว":r.status==="rejected"?"ยกเลิก":"รออนุมัติ")),
+          )))
+        )
+    ),
+    confirm && h("div",{style:S.modal},
+      h("div",{style:S.modalBox},
+        h("div",{style:{fontSize:34,textAlign:"center",marginBottom:10}},"🎁"),
+        h("div",{style:{fontWeight:700,fontSize:17,textAlign:"center",marginBottom:7}},"ยืนยันการแลก"),
+        h("div",{style:{textAlign:"center",marginBottom:18,color:"#64748B"}},confirm.name," ใช้ ",h("strong",{style:{color:"#DC2626"}},confirm.points_required+" แต้ม")),
+        h("div",{style:S.row,style:{display:"flex",gap:8,justifyContent:"center"}},
+          h("button",{style:S.btn("ghost"),onClick:()=>setConfirm(null)},"ยกเลิก"),
+          h("button",{style:S.btn("primary"),onClick:()=>doRedeem(confirm),disabled:busy},busy?h(Spin):"ยืนยัน"),
+        )
+      )
+    )
+  );
+}
+
+function LeaderboardPage() {
+  const [board,setBoard]=useState([]); const [loading,setLoading]=useState(true);
+  useEffect(()=>{ getLeaderboard().then(d=>{setBoard(d);setLoading(false);}); },[]);
+  const medals=["🥇","🥈","🥉"];
+  if(loading) return h(Loading);
+  return h("div",null,
+    h("div",{style:S.h2},"🏆 อันดับนักเรียน"),
+    h("div",{style:S.card},
+      board.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:40}},"ยังไม่มีข้อมูล")
+      : board.map((u,i)=>h("div",{key:u.id,style:{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:"1px solid #F1F5F9"}},
+          h("div",{style:{width:36,textAlign:"center",fontSize:i<3?22:15,fontWeight:800}},medals[i]||"#"+(i+1)),
+          h("div",{style:{width:36,height:36,borderRadius:"50%",background:"#EEF2FF",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,color:"#1E3A8A"}},u.name[0]),
+          h("div",{style:{flex:1,fontWeight:600}},u.name),
+          h("div",{style:{fontWeight:800,color:"#DC2626",fontSize:16}},u.points," ",h("span",{style:{fontSize:12,color:"#94A3B8",fontWeight:400}},"แต้ม")),
+        ))
+    )
+  );
+}
+
+// ─── Admin ────────────────────────────────────────────────────────────────────
+function AdminApp({user,logout}) {
+  const [page,setPage]=useState("dashboard");
+  const pages=[
+    {id:"dashboard",   label:"ภาพรวม",         icon:"📊"},
+    {id:"submissions", label:"ตรวจงาน",         icon:"✅"},
+    {id:"rewards",     label:"จัดการของรางวัล", icon:"🎁"},
+    {id:"redemptions", label:"อนุมัติการแลก",   icon:"⭐"},
+    {id:"board",       label:"อันดับ",           icon:"🏆"},
+  ];
+  return h("div",{style:S.app},
+    h(Navbar,{user,logout}),
+    h("div",{style:{display:"flex"}},
+      h(Sidebar,{pages,active:page,onNav:setPage}),
+      h("div",{style:{flex:1}},h("div",{style:S.main},
+        page==="dashboard"   && h(AdminDash,null),
+        page==="submissions" && h(AdminSubs,null),
+        page==="rewards"     && h(AdminRewards,null),
+        page==="redemptions" && h(AdminRedemptions,null),
+        page==="board"       && h(LeaderboardPage,null),
+      ))
+    )
+  );
+}
+
+function AdminDash() {
+  const [subs,setSubs]=useState([]); const [reds,setReds]=useState([]); const [loading,setLoading]=useState(true);
+  useEffect(()=>{ Promise.all([getAllSubmissions(),getAllRedemptions()]).then(([s,r])=>{setSubs(s);setReds(r);setLoading(false);}); },[]);
+  if(loading) return h(Loading);
+  const pending=subs.filter(s=>s.status==="pending").length;
+  const approved=subs.filter(s=>s.status==="approved").length;
+  const pendingRed=reds.filter(r=>r.status==="pending").length;
+  return h("div",null,
+    h("div",{style:S.h2},"🛡️ แดชบอร์ดแอดมิน"),
+    h("div",{style:S.statGrid},
+      h("div",{style:S.stat("#FEF3C7")},h("div",{style:S.statNum},pending),h("div",{style:S.statLbl},"⏳ งานรออนุมัติ")),
+      h("div",{style:S.stat("#DCFCE7")},h("div",{style:S.statNum},approved),h("div",{style:S.statLbl},"✅ อนุมัติแล้ว")),
+      h("div",{style:S.stat("#FEE2E2")},h("div",{style:S.statNum},pendingRed),h("div",{style:S.statLbl},"🎁 รออนุมัติแลก")),
+      h("div",{style:S.stat("#EEF2FF")},h("div",{style:S.statNum},subs.length),h("div",{style:S.statLbl},"📋 งานทั้งหมด")),
+    ),
+    h("div",{style:S.card},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},"งานรออนุมัติล่าสุด"),
+      subs.filter(s=>s.status==="pending").slice(0,5).map(s=>h("div",{key:s.id,style:{display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"1px solid #F1F5F9"}},
+        s.image && h("img",{src:s.image,style:S.thumb}),
+        h("div",{style:{flex:1}},h("div",{style:{fontWeight:600,fontSize:13}},s.user_name),h("div",{style:{fontSize:12,color:"#94A3B8"}},s.description)),
+        h("span",{style:S.badge("pending")},"รออนุมัติ"),
+      )),
+      subs.filter(s=>s.status==="pending").length===0 && h("div",{style:{color:"#94A3B8",textAlign:"center",padding:20}},"ไม่มีงานรออนุมัติ 🎉"),
+    )
+  );
+}
+
+function AdminSubs() {
+  const [subs,setSubs]=useState([]); const [loading,setLoading]=useState(true);
+  const [det,setDet]=useState(null); const [pts,setPts]=useState(10); const [reason,setReason]=useState(""); const [mode,setMode]=useState("approve"); const [busy,setBusy]=useState(false);
+  const load=()=>getAllSubmissions().then(s=>{setSubs(s);setLoading(false);});
+  useEffect(()=>{ load(); },[]);
+  const approve=async s=>{ setBusy(true); await approveSubmission(s.id,s.user_id,pts); await load(); setDet(null); setBusy(false); };
+  const reject=async s=>{ setBusy(true); await rejectSubmission(s.id,reason); await load(); setDet(null); setBusy(false); };
+  if(loading) return h(Loading);
+  const pending=subs.filter(s=>s.status==="pending");
+  const others=subs.filter(s=>s.status!=="pending");
+  return h("div",null,
+    h("div",{style:S.h2},"✅ ตรวจงานนักเรียน"),
+    h("div",{style:{fontWeight:700,color:"#D97706",marginBottom:10}},"รออนุมัติ ("+pending.length+")"),
+    h("div",{style:S.card},
+      pending.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:28}},"ไม่มีงานรอตรวจ 🎉")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["รูป","นักเรียน","รายละเอียด","วันที่","จัดการ"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,pending.map(s=>h("tr",{key:s.id},
+            h("td",{style:S.td},s.image?h("img",{src:s.image,style:{...S.thumb,cursor:"pointer"},onClick:()=>{setDet(s);setMode("approve");setPts(10);}})  :"-"),
+            h("td",{style:S.td},s.user_name),
+            h("td",{style:S.td},h("div",{style:{maxWidth:170}},s.description)),
+            h("td",{style:S.td},new Date(s.created_at).toLocaleDateString("th-TH")),
+            h("td",{style:S.td},h("div",{style:S.row},
+              h("button",{style:S.btn("success"),onClick:()=>{setDet(s);setMode("approve");setPts(10);}},"✅ อนุมัติ"),
+              h("button",{style:S.btn("danger"),onClick:()=>{setDet(s);setMode("reject");setReason("");}},"❌ ปฏิเสธ"),
+            )),
+          )))
+        )
+    ),
+    h("div",{style:{fontWeight:700,color:"#64748B",marginBottom:10}},"ประวัติ ("+others.length+")"),
+    h("div",{style:S.card},
+      others.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:20}},"ไม่มีข้อมูล")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["นักเรียน","รายละเอียด","สถานะ","แต้ม"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,others.map(s=>h("tr",{key:s.id},
+            h("td",{style:S.td},s.user_name),
+            h("td",{style:S.td},s.description),
+            h("td",{style:S.td},h("span",{style:S.badge(s.status)},statusLabel[s.status])),
+            h("td",{style:S.td},s.status==="approved"?h("span",{style:{color:"#059669",fontWeight:700}},"+"+s.points_awarded):"-"),
+          )))
+        )
+    ),
+    det && h("div",{style:S.modal,onClick:()=>setDet(null)},
+      h("div",{style:S.modalBox,onClick:e=>e.stopPropagation()},
+        det.image && h("img",{src:det.image,style:{width:"100%",borderRadius:10,marginBottom:14}}),
+        h("div",{style:{fontWeight:700,marginBottom:3}},det.user_name),
+        h("div",{style:{color:"#64748B",marginBottom:14,fontSize:13}},det.description),
+        mode==="approve"
+          ? h("div",null,
+              h("label",{style:S.label},"แต้มที่จะมอบให้"),
+              h("input",{type:"number",style:{...S.input,marginBottom:14},value:pts,min:1,max:100,onChange:e=>setPts(+e.target.value)}),
+              h("div",{style:S.row},
+                h("button",{style:S.btn("ghost"),onClick:()=>setDet(null)},"ยกเลิก"),
+                h("button",{style:S.btn("success"),onClick:()=>approve(det),disabled:busy},busy?h(Spin):"✅ อนุมัติ +"+pts+" แต้ม"),
+              )
+            )
+          : h("div",null,
+              h("label",{style:S.label},"เหตุผลที่ปฏิเสธ"),
+              h("textarea",{style:{...S.input,height:80,marginBottom:14},placeholder:"เหตุผล...",value:reason,onChange:e=>setReason(e.target.value)}),
+              h("div",{style:S.row},
+                h("button",{style:S.btn("ghost"),onClick:()=>setDet(null)},"ยกเลิก"),
+                h("button",{style:S.btn("danger"),onClick:()=>reject(det),disabled:busy},busy?h(Spin):"❌ ปฏิเสธ"),
+              )
+            )
+      )
+    )
+  );
+}
+
+function AdminRewards() {
+  const [rewards,setRewards]=useState([]); const [loading,setLoading]=useState(true);
+  const [form,setForm]=useState({name:"",points_required:20,stock:5}); const [editing,setEditing]=useState(null); const [busy,setBusy]=useState(false);
+  const load=()=>getRewards().then(r=>{setRewards(r);setLoading(false);});
+  useEffect(()=>{ load(); },[]);
+  const save=async()=>{ if(!form.name) return; setBusy(true); if(editing) await updateReward(editing,form); else await addReward(form.name,form.points_required,form.stock); await load(); setForm({name:"",points_required:20,stock:5}); setEditing(null); setBusy(false); };
+  const del=async id=>{ if(confirm("ลบของรางวัลนี้?")){ await deleteReward(id); load(); } };
+  const edit=r=>{ setEditing(r.id); setForm({name:r.name,points_required:r.points_required,stock:r.stock}); };
+  const set=k=>e=>setForm({...form,[k]:e.target.value});
+  if(loading) return h(Loading);
+  return h("div",null,
+    h("div",{style:S.h2},"🎁 จัดการของรางวัล"),
+    h("div",{style:S.card},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},editing?"แก้ไขของรางวัล":"เพิ่มของรางวัลใหม่"),
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 100px 100px auto",gap:10,alignItems:"end"}},
+        h("div",null,h("label",{style:S.label},"ชื่อ"),h("input",{style:S.input,value:form.name,onChange:set("name"),placeholder:"ชื่อของรางวัล..."})),
+        h("div",null,h("label",{style:S.label},"แต้ม"),h("input",{type:"number",style:S.input,value:form.points_required,min:1,onChange:set("points_required")})),
+        h("div",null,h("label",{style:S.label},"จำนวน"),h("input",{type:"number",style:S.input,value:form.stock,min:0,onChange:set("stock")})),
+        h("div",{style:{display:"flex",gap:7}},
+          h("button",{style:S.btn("primary"),onClick:save,disabled:busy},busy?h(Spin):editing?"บันทึก":"➕ เพิ่ม"),
+          editing && h("button",{style:S.btn("ghost"),onClick:()=>{setEditing(null);setForm({name:"",points_required:20,stock:5});}},"ยกเลิก"),
+        ),
+      ),
+    ),
+    h("div",{style:S.card},
+      rewards.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:28}},"ยังไม่มีของรางวัล")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["ชื่อ","แต้ม","คงเหลือ","จัดการ"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,rewards.map(r=>h("tr",{key:r.id},
+            h("td",{style:S.td},r.name),
+            h("td",{style:S.td},h("span",{style:{color:"#DC2626",fontWeight:700}},r.points_required)),
+            h("td",{style:S.td},r.stock),
+            h("td",{style:S.td},h("div",{style:S.row},
+              h("button",{style:S.btn("ghost"),onClick:()=>edit(r)},"แก้ไข"),
+              h("button",{style:{...S.btn("danger"),padding:"6px 9px"},onClick:()=>del(r.id)},"🗑️"),
+            )),
+          )))
+        )
+    )
+  );
+}
+
+function AdminRedemptions() {
+  const [reds,setReds]=useState([]); const [loading,setLoading]=useState(true); const [busy,setBusy]=useState(null);
+  const load=()=>getAllRedemptions().then(r=>{setReds(r);setLoading(false);});
+  useEffect(()=>{ load(); },[]);
+  const approve=async r=>{ setBusy(r.id); await approveRedemption(r.id); await load(); setBusy(null); };
+  const reject=async r=>{ setBusy(r.id); const rList=await getRewards(); const rw=rList.find(x=>x.id===r.reward_id); await rejectRedemption(r.id,r.user_id,r.reward_id,rw?.points_required||0); await load(); setBusy(null); };
+  if(loading) return h(Loading);
+  const pending=reds.filter(r=>r.status==="pending");
+  const done=reds.filter(r=>r.status!=="pending");
+  return h("div",null,
+    h("div",{style:S.h2},"🎁 อนุมัติการแลกของ"),
+    h("div",{style:{fontWeight:700,color:"#D97706",marginBottom:10}},"รออนุมัติ ("+pending.length+")"),
+    h("div",{style:S.card},
+      pending.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:28}},"ไม่มีรายการรออนุมัติ 🎉")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["นักเรียน","ของรางวัล","วันที่","จัดการ"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,pending.map(r=>h("tr",{key:r.id},
+            h("td",{style:S.td},r.user_id),
+            h("td",{style:S.td},r.reward_name),
+            h("td",{style:S.td},new Date(r.created_at).toLocaleDateString("th-TH")),
+            h("td",{style:S.td},h("div",{style:S.row},
+              h("button",{style:S.btn("success"),onClick:()=>approve(r),disabled:busy===r.id},busy===r.id?h(Spin):"✅ มอบของ"),
+              h("button",{style:S.btn("danger"),onClick:()=>reject(r),disabled:busy===r.id},busy===r.id?h(Spin):"❌ ยกเลิก"),
+            )),
+          )))
+        )
+    ),
+    h("div",{style:{fontWeight:700,color:"#64748B",marginBottom:10}},"ประวัติ ("+done.length+")"),
+    h("div",{style:S.card},
+      done.length===0 ? h("div",{style:{color:"#94A3B8",textAlign:"center",padding:20}},"ไม่มีข้อมูล")
+      : h("table",{style:S.table},
+          h("thead",null,h("tr",null,["นักเรียน","ของรางวัล","สถานะ"].map(t=>h("th",{key:t,style:S.th},t)))),
+          h("tbody",null,done.map(r=>h("tr",{key:r.id},
+            h("td",{style:S.td},r.user_id),
+            h("td",{style:S.td},r.reward_name),
+            h("td",{style:S.td},h("span",{style:S.badge(r.status==="approved"?"approved":"rejected")},r.status==="approved"?"มอบแล้ว":"ยกเลิก")),
+          )))
+        )
+    )
+  );
+}
+
+// ─── Mount ────────────────────────────────────────────────────────────────────
+createRoot(document.getElementById("root")).render(h(App));
+</script>
+</body>
+</html>
